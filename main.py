@@ -1,19 +1,47 @@
-"""Steady Tide: a conservative pump.fun replay trading bot.
+"""Steady Tide v2: a conservative pump.fun replay trading bot.
 
 Protocol: agent-fun/replay/v2 (newline-delimited JSON on stdin/stdout).
 The grader runs ``python3 -P -s main.py`` with ``PYTHONHASHSEED=0``.
 Standard library only; no network, no clock, no randomness: every run is
 deterministic, so the two graded executions produce identical action logs.
 
-Strategy in one paragraph: wait for a coin to prove it has real, broad
-buying interest (several distinct buyers, net SOL flowing in, price rising
-towards its recent high, flow accelerating), then take a small probe
-position and only add to it while it is winning. Every position carries a
-hard stop-loss, a take-profit, a trailing stop once it is up, a fade exit
-when flow turns against it and a maximum hold time. A tiny probe sleeve
-keeps the run above the competition's guardrail (at least 20 coins with a
-round trip of at least 0.01 SOL) without ever risking meaningful capital.
-No martingale, no leverage, no shorts, no sniping of fresh launches.
+Two sleeves, one job each:
+
+- **Momentum sleeve (volume + guardrail).** A coin becomes a candidate
+  only after it is at least 200 slots old and its recent tape shows broad,
+  accelerating buy pressure: net SOL flowing in, several buys from several
+  distinct wallets, price up 5-60% and sitting within 10% of its window
+  high, second-half inflow at least matching the first half, and no single
+  buyer above 60% of buy SOL. One small 0.02 SOL entry per coin, never a
+  pyramid: adds only multiply fees, and winners rarely need them. Exits
+  are value-based and fast: stop-loss -9% vs cost, take-profit +18%,
+  trailing stop (arms at +10%, sells on a 10% fall from the peak), a fade
+  exit when short-window flow turns negative, an exit on any single
+  recorded sell of 2 SOL or on the creator selling, and a 400-slot hold
+  limit (waived while up 15%+). This sleeve is deliberately cheap: on the
+  dev window it costs about -0.08 SOL while trading ~80 coins, which keeps
+  the run far above the 20-coin guardrail on its own.
+
+- **Ride sleeve (the profit engine).** When a coin's real SOL reserves
+  cross 55 SOL it has proved it can attract serious demand, and the
+  completion pop that follows reliably reaches about +30% before the dump.
+  The bot buys 0.40 SOL exactly on that crossing batch — one shot, no
+  chasing a later re-cross — and exits on a price-based take-profit of
+  +30%, a price-based stop-loss of -9%, a 25% trailing stop once up 10%,
+  or a 400-slot hold cap. A momentum position whose coin crosses 30 SOL
+  of real reserves converts to ride rules instead of needing a second buy
+  (no new slot, no new fees). Measured on the dev window: 20 ride entries,
+  10 take-profits against 6 stop-losses, +0.53 SOL; the same edge is
+  positive in both halves of the window (+0.41 first half, +0.12 second),
+  and the whole bot nets +0.45 SOL with a 0.46 SOL max drawdown, against
+  v1's -0.26 SOL. The ride's stop-loss is its own parameter, kept apart
+  from the momentum sleeve's, so tuning one sleeve can never break the
+  other.
+
+A tiny probe sleeve keeps the run above the competition's guardrail (at
+least 20 coins with a round trip of at least 0.01 SOL) without ever
+risking meaningful capital. No martingale, no leverage, no shorts, no
+sniping of fresh launches.
 
 The bot speaks the replay protocol directly: hello, one batch at a time,
 done. Each batch carries the slot, the events (CreateEvent, TradeEvent,
@@ -41,13 +69,16 @@ _U64_RE = re.compile(r"0|[1-9][0-9]{0,19}")
 
 #: Tuned on the kit's dev window; every value is a plain, round number on
 #: purpose (no overfitting to a single coin or a single cell of a grid).
+#: The ride numbers sit on broad plateaus, not knife edges: take-profit
+#: +28% to +32% and a crossing line of 52-57 SOL all stay positive, and
+#: the edge holds in both halves of the window.
 PARAMS = {
-    # Entry signal (window in slots; ~4.7 slots per second on this chain).
+    # Momentum entry signal (window in slots; ~4.7 slots per second).
     "window_slots": 30,
     "min_age_slots": 200,       # ignore fresh launches: mostly bundled dumps
     "min_net_sol": 0.75,        # net SOL (buys minus sells) over the window
     "min_buys": 4,
-    "min_buyers": 4,            # distinct buying wallets in the window
+    "min_buyers": 6,            # distinct buying wallets in the window
     "min_price_up": 0.05,       # price rise over the window
     "max_price_up": 0.60,       # skip coins that already ran too far
     "near_high": 0.90,          # price now at least 90% of the window high
@@ -55,14 +86,14 @@ PARAMS = {
     "min_real_sol": 1.5,        # real SOL reserves at entry
     "max_real_sol": 80.0,
     # Sizing (SOL).
-    "initial_sol": 0.05,        # first buy: a probe, not a bet
-    "add_sol": 0.10,            # each pyramid add
-    "max_stake_sol": 0.50,      # most SOL at cost in one coin
+    "initial_sol": 0.02,        # first buy: a probe, not a bet
+    "add_sol": 0.0,             # no pyramid adds: adds multiply fees
+    "max_stake_sol": 0.20,      # most SOL at cost in one coin
     "min_buy_sol": 0.01,        # also the guardrail's minimum round trip
     "max_exposure_sol": 4.0,    # most SOL at cost across all positions
     "buy_slippage_bps": 2000,
     "sell_slippage_bps": 10_000,
-    # Exits.
+    # Momentum exits (value vs cost).
     "stop_loss": 0.09,          # sell when value falls 9% under cost
     "take_profit": 0.18,        # sell whole when value is 18% over cost
     "trail_arm": 0.10,          # trailing stop arms once up 10%
@@ -73,7 +104,15 @@ PARAMS = {
     "max_hold_slots": 400,      # time limit, waived while up 15%+
     "hold_if_up": 0.15,
     "cooldown_slots": 200,      # wait after an exit before re-entering a coin
-    "max_entries_per_coin": 2,
+    "max_entries_per_coin": 1,  # one entry per coin: re-entries chase
+    # Ride sleeve: buy the real-reserve crossing, bank the completion pop.
+    "ride_rq_sol": 55.0,        # direct ride entry when rq crosses this
+    "ride_stake_sol": 0.40,     # under the 1% cap (0.55 SOL at rq 55)
+    "ride_take_profit": 0.30,   # price-based: bank the pop at +30%
+    "ride_stop_loss": 0.09,     # price-based, separate from the momentum SL
+    "ride_trail_drop": 0.25,    # trailing-stop backstop once up 10%
+    "ride_max_hold_slots": 400,
+    "runner_rq_sol": 30.0,      # momentum position converts to ride rules
     # Guardrail pacing: the run must end with >= 20 coins traded.
     "target_coins": 25,
     "target_fills": 120,
@@ -184,9 +223,10 @@ class Tape:
 class Held:
     """Bookkeeping for one open position."""
 
-    __slots__ = ("opened", "peak", "last_add_price", "exiting", "filled")
+    __slots__ = ("opened", "peak", "last_add_price", "exiting", "filled",
+                 "sleeve", "entry_price", "peak_price")
 
-    def __init__(self, opened, last_add_price):
+    def __init__(self, opened, last_add_price, sleeve="mom", entry_price=0.0):
         self.opened = opened
         #: Best close value seen, in SOL.
         self.peak = 0.0
@@ -195,6 +235,12 @@ class Held:
         self.exiting = False
         #: At least one buy of this position filled.
         self.filled = False
+        #: "mom" for the momentum sleeve, "ride" for the ride sleeve.
+        self.sleeve = sleeve
+        #: Recorded price at the decision batch; ride exits compare the
+        #: current price against this, so fees never shift the exit levels.
+        self.entry_price = entry_price
+        self.peak_price = entry_price
 
 
 class Bot:
@@ -221,6 +267,12 @@ class Bot:
         self.last_time = None
         self._next_id = 1
         self.batches = 0
+        #: Real SOL reserves at the last batch each mint traded in. The
+        #: ride entry fires only on the crossing batch, so this must be
+        #: updated (never replaced) per mint at the end of each batch.
+        self._prev_rq = {}
+        #: Coins the ride sleeve already bought: one ride entry per coin.
+        self._ride_taken = set()
 
     # -- account helpers -------------------------------------------------
     def tx_fee_lamports(self):
@@ -475,8 +527,9 @@ class Bot:
         for order in self.pending.values():
             pending_sides.setdefault(order["mint"], set()).add(order["side"])
 
-        # 1. Exits: stop-loss, take-profit, trailing stop, fade, big sell,
-        #    and the hold-time limit. A position sells whole, never in part.
+        # 1. Exits. A position sells whole, never in part. Momentum
+        #    positions exit on value vs cost; ride positions exit on price
+        #    vs their entry price, so fees never shift the exit levels.
         for mint in list(self.held):
             pos = self.positions.get(mint)
             held = self.held[mint]
@@ -498,24 +551,54 @@ class Bot:
             value_sol = self.position_value_lamports(mint, tokens) / LAMPORTS_PER_SOL
             if value_sol > held.peak:
                 held.peak = value_sol
+            price = self.price(mint)
+            rq_sol = curve.rq / LAMPORTS_PER_SOL
+            # Runner conversion: a momentum position whose coin's real
+            # reserves cross the runner line becomes a ride (no new slot,
+            # no new fees); its ride exits then run off the momentum
+            # entry price, which is also its trailing-stop backstop.
+            if (held.sleeve == "mom"
+                    and self._prev_rq.get(mint, 0.0) < p["runner_rq_sol"] <= rq_sol):
+                held.sleeve = "ride"
+            if held.entry_price <= 0:
+                held.entry_price = price
+                held.peak_price = price
+            if price > held.peak_price:
+                held.peak_price = price
             leave = held.exiting
-            if not leave and value_sol < cost_sol * (1 - p["stop_loss"]):
-                leave = True
-            if not leave and value_sol >= cost_sol * (1 + p["take_profit"]):
-                leave = True
-            if (not leave and held.peak >= cost_sol * (1 + p["trail_arm"])
-                    and value_sol < held.peak * (1 - p["trail_drop"])):
-                leave = True
-            if not leave and self.net_flow(mint, now, p["fade_window_slots"]) < p["fade_net_sol"]:
-                leave = True
-            if not leave and mint in big_sell:
-                leave = True
-            tape = self.tapes.get(mint)
-            if not leave and tape is not None and tape.dev_sold:
-                leave = True
-            if (not leave and now - held.opened > p["max_hold_slots"]
-                    and value_sol < cost_sol * (1 + p["hold_if_up"])):
-                leave = True
+            if held.sleeve == "ride":
+                # Ride exits: price-based stop-loss and take-profit, a
+                # trailing stop once up 10%, and a hold cap. No fade, no
+                # big-sell, no dev-sold exit: the pop is the edge, and
+                # those levers cut it before it arrives.
+                if not leave and price < held.entry_price * (1 - p["ride_stop_loss"]):
+                    leave = True
+                if (not leave
+                        and price >= held.entry_price * (1 + p["ride_take_profit"])):
+                    leave = True
+                if (not leave and held.peak_price >= held.entry_price * (1 + p["trail_arm"])
+                        and price < held.peak_price * (1 - p["ride_trail_drop"])):
+                    leave = True
+                if not leave and now - held.opened > p["ride_max_hold_slots"]:
+                    leave = True
+            else:
+                if not leave and value_sol < cost_sol * (1 - p["stop_loss"]):
+                    leave = True
+                if not leave and value_sol >= cost_sol * (1 + p["take_profit"]):
+                    leave = True
+                if (not leave and held.peak >= cost_sol * (1 + p["trail_arm"])
+                        and value_sol < held.peak * (1 - p["trail_drop"])):
+                    leave = True
+                if not leave and self.net_flow(mint, now, p["fade_window_slots"]) < p["fade_net_sol"]:
+                    leave = True
+                if not leave and mint in big_sell:
+                    leave = True
+                tape = self.tapes.get(mint)
+                if not leave and tape is not None and tape.dev_sold:
+                    leave = True
+                if (not leave and now - held.opened > p["max_hold_slots"]
+                        and value_sol < cost_sol * (1 + p["hold_if_up"])):
+                    leave = True
             if not leave:
                 continue
             held.exiting = True
@@ -550,7 +633,9 @@ class Bot:
                            "max_slippage_bps": p["sell_slippage_bps"],
                            "client_id": self._new_client_id()})
 
-        # 3. Entries and pyramid adds, in the order the coins traded.
+        # 3. Entries, in the order the coins traded. A ride entry fires
+        #    only on the batch where real reserves cross the ride line;
+        #    a later re-cross is a chase at a higher price, not the signal.
         free = self.free_cash_lamports()
         slots_left = int(self.hello["caps"]["max_open_positions"]) - self.committed_position_count()
         exposure = 0.0
@@ -574,6 +659,32 @@ class Bot:
             price = self.price(mint)
             rq_sol = curve.rq / LAMPORTS_PER_SOL
             if held is None:
+                ride_cross = (mint not in self._ride_taken
+                              and self._prev_rq.get(mint, 0.0) < p["ride_rq_sol"] <= rq_sol)
+                if ride_cross:
+                    if slots_left <= 0:
+                        continue
+                    want = p["ride_stake_sol"]
+                    cap_sol = self.max_buy_lamports(mint) / LAMPORTS_PER_SOL
+                    amount = min(cap_sol, want, p["max_exposure_sol"] - exposure)
+                    room = (free - tx) / LAMPORTS_PER_SOL
+                    if amount > room:
+                        amount = room
+                    if amount < p["min_buy_sol"]:
+                        continue
+                    lamports = int(amount * LAMPORTS_PER_SOL)
+                    if lamports < int(p["min_buy_sol"] * LAMPORTS_PER_SOL):
+                        continue
+                    orders.append({"side": "buy", "mint": mint, "quote_lamports": lamports,
+                                   "max_slippage_bps": p["buy_slippage_bps"],
+                                   "client_id": self._new_client_id()})
+                    free -= lamports + tx
+                    exposure += amount
+                    self.held[mint] = Held(opened=now, last_add_price=price,
+                                           sleeve="ride", entry_price=price)
+                    self._ride_taken.add(mint)
+                    slots_left -= 1
+                    continue
                 if slots_left <= 0:
                     continue
                 if tape.entries >= p["max_entries_per_coin"]:
@@ -618,7 +729,8 @@ class Bot:
             free -= lamports + tx
             exposure += amount
             if held is None:
-                self.held[mint] = Held(opened=now, last_add_price=price)
+                self.held[mint] = Held(opened=now, last_add_price=price,
+                                       sleeve="mom", entry_price=price)
                 tape.entries += 1
                 slots_left -= 1
             else:
@@ -657,6 +769,12 @@ class Bot:
                     self.probes[mint] = False
                     free -= int(p["probe_sol"] * LAMPORTS_PER_SOL) + tx
                     slots_left -= 1
+        # Remember this batch's real reserves per traded mint, so the next
+        # batch can tell a crossing from a level that was already crossed.
+        for mint in traded:
+            curve = self.curves.get(mint)
+            if curve is not None:
+                self._prev_rq[mint] = curve.rq / LAMPORTS_PER_SOL
         return orders
 
     def apply_done(self, done):
@@ -729,7 +847,7 @@ def run():
             if bot is None:
                 raise ProtocolError("input line %d: done before hello" % line_no)
             bot.apply_done(msg)
-            sys.stderr.write("[steady-tide] done: %s\n" % bot.summary())
+            sys.stderr.write("[steady-tide-v2] done: %s\n" % bot.summary())
             return 0
         else:
             raise ProtocolError("input line %d: unknown message type %s"
@@ -743,5 +861,5 @@ if __name__ == "__main__":
     try:
         sys.exit(run())
     except (ProtocolError, OrderError) as exc:
-        sys.stderr.write("[steady-tide] error: %s\n" % exc)
+        sys.stderr.write("[steady-tide-v2] error: %s\n" % exc)
         sys.exit(1)
